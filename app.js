@@ -12,7 +12,7 @@
     picker: $('#picker'),
     viewer: $('#viewer'), viewTrack: $('#viewTrack'), viewStage: $('#viewStage'), viewClose: $('#viewClose'),
     viewCount: $('#viewCount'), viewName: $('#viewName'),
-    vSave: $('#vSave'), vShare: $('#vShare'), vDelete: $('#vDelete')
+    vEdit: $('#vEdit'), vSave: $('#vSave'), vShare: $('#vShare'), vDelete: $('#vDelete')
   };
 
   /* =========================================================
@@ -465,6 +465,7 @@
     const it = list[viewIndex]; if (!it) return;
     el.viewCount.textContent = `${viewIndex + 1} de ${list.length}`;
     el.viewName.textContent = `${it.name} · ${fmtSize(it.size)}`;
+    el.vEdit.hidden = it.type !== 'photo';
     resetConfirm(el.vDelete, 'Eliminar');
   }
   function openViewer(i) {
@@ -501,7 +502,7 @@
   el.viewClose.addEventListener('click', () => el.viewer.close());
   el.viewer.addEventListener('close', () => { vtrack.replaceChildren(); resetConfirm(el.vDelete, 'Eliminar'); });
   document.addEventListener('keydown', e => {
-    if (!el.viewer.open) return;
+    if (!el.viewer.open || (E && E.dlg.open)) return;
     if (e.key === 'ArrowLeft') slideTo(-1);
     if (e.key === 'ArrowRight') slideTo(1);
   });
@@ -544,7 +545,7 @@
   el.vShare.addEventListener('click', () => { const it = list[viewIndex]; if (it) shareItems([it]); });
   el.vDelete.addEventListener('click', async () => {
     const it = list[viewIndex]; if (!it) return;
-    if (!confirmTwice(el.vDelete, 'Eliminar', 'Toca otra vez para eliminar')) return;
+    if (!confirmTwice(el.vDelete, 'Eliminar', '¿Seguro?')) return;
     const n = await removeItems([it]);
     if (!n) return;
     renderGrid();
@@ -553,6 +554,359 @@
     renderSlides(); updateViewerUI();
     toast('Eliminado');
   });
+
+  /* =========================================================
+     Editor de fotos: recortar, girar, voltear, ajustes y filtros
+     ========================================================= */
+  // <pure>
+  const clampN = (v, a, b) => Math.min(b, Math.max(a, v));
+
+  // Rectángulo (en coordenadas 0..1) al arrastrar una esquina. (ax, ay) es la esquina opuesta, fija.
+  // nr = proporción ancho/alto en coordenadas normalizadas (0 = libre).
+  function cornerRect(ax, ay, px, py, nr) {
+    const MIN = 0.06;
+    const sx = px >= ax ? 1 : -1, sy = py >= ay ? 1 : -1;
+    let w = Math.abs(px - ax), h = Math.abs(py - ay);
+    const maxW = sx > 0 ? 1 - ax : ax, maxH = sy > 0 ? 1 - ay : ay;
+    if (nr) {
+      if (w / Math.max(h, 1e-6) > nr) w = h * nr; else h = w / nr;
+      if (w < MIN) { w = MIN; h = w / nr; }
+      const k = Math.min(1, maxW / w, maxH / h);
+      w *= k; h *= k;
+    } else {
+      w = Math.min(Math.max(w, MIN), maxW);
+      h = Math.min(Math.max(h, MIN), maxH);
+    }
+    return { x: sx > 0 ? ax : ax - w, y: sy > 0 ? ay : ay - h, w, h };
+  }
+
+  // Rectángulo centrado con la proporción dada (coordenadas 0..1)
+  function centeredRect(nr) {
+    let w, h;
+    if (nr >= 1) { w = 1; h = 1 / nr; } else { h = 1; w = nr; }
+    w *= 0.92; h *= 0.92;
+    return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+  }
+
+  const FILTERS = [
+    { id: 'none', name: 'Normal', f: {} },
+    { id: 'bw', name: 'B/N', f: { grayscale: 1, contrast: 1.1 } },
+    { id: 'sepia', name: 'Sepia', f: { sepia: 0.85, contrast: 1.05 } },
+    { id: 'vivid', name: 'Vívido', f: { saturate: 1.45, contrast: 1.12 } },
+    { id: 'cold', name: 'Frío', f: { saturate: 1.05, brightness: 1.02 }, tint: 'rgba(60,120,255,.14)' },
+    { id: 'warm', name: 'Cálido', f: { saturate: 1.15, sepia: 0.18 }, tint: 'rgba(255,150,40,.12)' },
+    { id: 'fade', name: 'Desvanecido', f: { contrast: 0.82, brightness: 1.08, saturate: 0.85 } }
+  ];
+
+  function filterParams(st) {
+    const p = FILTERS.find(x => x.id === st.filter) || FILTERS[0], F = p.f, a = st.adj;
+    return {
+      brightness: (1 + a.b / 100) * (F.brightness || 1),
+      contrast: (1 + a.c / 100) * (F.contrast || 1),
+      saturate: (1 + a.s / 100) * (F.saturate || 1),
+      grayscale: F.grayscale || 0, sepia: F.sepia || 0, tint: p.tint || null
+    };
+  }
+  function cssFilter(f) {
+    const parts = [];
+    if (f.brightness !== 1) parts.push(`brightness(${f.brightness.toFixed(3)})`);
+    if (f.contrast !== 1) parts.push(`contrast(${f.contrast.toFixed(3)})`);
+    if (f.saturate !== 1) parts.push(`saturate(${f.saturate.toFixed(3)})`);
+    if (f.grayscale) parts.push(`grayscale(${f.grayscale})`);
+    if (f.sepia) parts.push(`sepia(${f.sepia})`);
+    return parts.join(' ') || 'none';
+  }
+  // Respaldo para navegadores sin ctx.filter
+  function pixelFilter(ctx, w, h, f) {
+    const id = ctx.getImageData(0, 0, w, h), d = id.data;
+    const b = f.brightness, c = f.contrast, s = f.saturate, g = f.grayscale, sp = f.sepia;
+    for (let i = 0; i < d.length; i += 4) {
+      let r = d[i] * b, gg = d[i + 1] * b, bl = d[i + 2] * b;
+      r = (r - 128) * c + 128; gg = (gg - 128) * c + 128; bl = (bl - 128) * c + 128;
+      const l = 0.2126 * r + 0.7152 * gg + 0.0722 * bl;
+      r = l + (r - l) * s; gg = l + (gg - l) * s; bl = l + (bl - l) * s;
+      if (g) { const l2 = 0.2126 * r + 0.7152 * gg + 0.0722 * bl; r += (l2 - r) * g; gg += (l2 - gg) * g; bl += (l2 - bl) * g; }
+      if (sp) {
+        const nr = 0.393 * r + 0.769 * gg + 0.189 * bl, ng = 0.349 * r + 0.686 * gg + 0.168 * bl, nb = 0.272 * r + 0.534 * gg + 0.131 * bl;
+        r += (nr - r) * sp; gg += (ng - gg) * sp; bl += (nb - bl) * sp;
+      }
+      d[i] = r < 0 ? 0 : r > 255 ? 255 : r; d[i + 1] = gg < 0 ? 0 : gg > 255 ? 255 : gg; d[i + 2] = bl < 0 ? 0 : bl > 255 ? 255 : bl;
+    }
+    ctx.putImageData(id, 0, 0);
+  }
+  // </pure>
+
+  const hasCtxFilter = (() => { try { const c = document.createElement('canvas').getContext('2d'); return !!c && 'filter' in c; } catch { return false; } })();
+
+  // Dibuja la foto girada/volteada, recortada a `region` (0..1), con ajustes y filtro, a escala `scale`
+  function renderTo(canvas, img, W, H, st, region, scale) {
+    const ow = st.rot % 2 ? H : W, oh = st.rot % 2 ? W : H;
+    const cw = Math.max(1, Math.round(ow * region.w * scale)), ch = Math.max(1, Math.round(oh * region.h * scale));
+    canvas.width = cw; canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    const f = filterParams(st);
+    ctx.imageSmoothingQuality = 'high';
+    if (hasCtxFilter) ctx.filter = cssFilter(f);
+    ctx.save();
+    ctx.translate(-region.x * ow * scale, -region.y * oh * scale);
+    ctx.scale(scale, scale);
+    ctx.translate(ow / 2, oh / 2);
+    if (st.flip) ctx.scale(-1, 1);
+    ctx.rotate(st.rot * Math.PI / 2);
+    ctx.drawImage(img, -W / 2, -H / 2, W, H);
+    ctx.restore();
+    if (hasCtxFilter) ctx.filter = 'none'; else pixelFilter(ctx, cw, ch, f);
+    if (f.tint) {
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = f.tint; ctx.fillRect(0, 0, cw, ch);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  const E = {
+    dlg: $('#editor'), cancel: $('#edCancel'), reset: $('#edReset'), save: $('#edSave'),
+    stage: $('#edStage'), box: $('#edBox'), canvas: $('#edCanvas'), crop: $('#crop'),
+    rot: $('#edRot'), flip: $('#edFlip'), ratios: $('#edRatios'), filters: $('#filterList'),
+    sheet: $('#saveSheet'), copy: $('#saveCopy'), replace: $('#saveReplace'), saveCancel: $('#saveCancel')
+  };
+  const FULL = { x: 0, y: 0, w: 1, h: 1 };
+  const RATIOS = [['free', 'Libre'], ['orig', 'Original'], [1, '1:1'], [4 / 3, '4:3'], [3 / 4, '3:4'], [16 / 9, '16:9'], [9 / 16, '9:16']];
+  let ed = null, edRaf = 0, cd = null;
+
+  const orientedSize = () => (ed.rot % 2 ? [ed.H, ed.W] : [ed.W, ed.H]);
+  function lockFactor() {
+    if (ed.ratio === 'free') return 0;
+    const [ow, oh] = orientedSize();
+    const r = ed.ratio === 'orig' ? ow / oh : ed.ratio;
+    return r * oh / ow;
+  }
+  function isDirty() {
+    const c = ed.crop, a = ed.adj;
+    return ed.rot !== 0 || ed.flip || a.b || a.c || a.s || ed.filter !== 'none' || c.w < 0.999 || c.h < 0.999 || c.x > 0.001 || c.y > 0.001;
+  }
+
+  function layoutBox() {
+    if (!ed) return;
+    const [ow, oh] = orientedSize();
+    const aw = E.stage.clientWidth - 56, ah = E.stage.clientHeight - 56;
+    if (aw <= 0 || ah <= 0) return;
+    const s = Math.min(aw / ow, ah / oh);
+    E.box.style.width = Math.round(ow * s) + 'px';
+    E.box.style.height = Math.round(oh * s) + 'px';
+  }
+  function updateCropUI() {
+    const c = ed.crop;
+    E.crop.style.left = (c.x * 100) + '%'; E.crop.style.top = (c.y * 100) + '%';
+    E.crop.style.width = (c.w * 100) + '%'; E.crop.style.height = (c.h * 100) + '%';
+  }
+  function schedulePreview() {
+    if (edRaf) return;
+    edRaf = requestAnimationFrame(() => {
+      edRaf = 0;
+      if (!ed) return;
+      const [ow, oh] = orientedSize();
+      renderTo(E.canvas, ed.img, ed.W, ed.H, ed, FULL, Math.min(1, 1400 / Math.max(ow, oh)));
+    });
+  }
+  function renderThumbs() {
+    if (!ed) return;
+    const [ow, oh] = orientedSize();
+    const reg = ow > oh ? { x: (1 - oh / ow) / 2, y: 0, w: oh / ow, h: 1 } : { x: 0, y: (1 - ow / oh) / 2, w: 1, h: ow / oh };
+    const scale = 128 / Math.min(ow, oh);
+    E.filters.querySelectorAll('canvas').forEach((c, i) => {
+      renderTo(c, ed.img, ed.W, ed.H, { rot: ed.rot, flip: ed.flip, adj: { b: 0, c: 0, s: 0 }, filter: FILTERS[i].id }, reg, scale);
+    });
+  }
+
+  function setTab(name) {
+    $$('#edPanel .tabs button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.tab === name)));
+    $$('#edPanel .tool').forEach(t => { t.hidden = t.dataset.tool !== name; });
+    E.crop.classList.toggle('locked', name !== 'crop');
+    if (name === 'filters') renderThumbs();
+  }
+  $$('#edPanel .tabs button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
+
+  function syncEditorUI() {
+    const a = ed.adj;
+    $$('[data-adj]').forEach(i => { i.value = a[i.dataset.adj]; });
+    $('#oB').textContent = a.b; $('#oC').textContent = a.c; $('#oS').textContent = a.s;
+    $$('#edRatios button').forEach((b, i) => b.setAttribute('aria-pressed', String(RATIOS[i][0] === ed.ratio)));
+    $$('#filterList .fbtn').forEach((b, i) => b.setAttribute('aria-pressed', String(FILTERS[i].id === ed.filter)));
+    updateCropUI();
+  }
+
+  // Chips de proporción y botones de filtro (se crean una sola vez)
+  RATIOS.forEach(([val, label]) => {
+    const b = document.createElement('button'); b.textContent = label;
+    b.addEventListener('click', () => {
+      if (!ed) return;
+      ed.ratio = val;
+      if (val !== 'free') ed.crop = centeredRect(lockFactor());
+      syncEditorUI();
+    });
+    E.ratios.append(b);
+  });
+  FILTERS.forEach(fl => {
+    const b = document.createElement('button'); b.className = 'fbtn';
+    const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+    const n = document.createElement('span'); n.textContent = fl.name;
+    b.append(c, n);
+    b.addEventListener('click', () => { if (!ed) return; ed.filter = fl.id; syncEditorUI(); schedulePreview(); });
+    E.filters.append(b);
+  });
+
+  E.rot.addEventListener('click', () => {
+    if (!ed) return;
+    ed.rot = (ed.rot + 1) % 4;
+    ed.crop = ed.ratio === 'free' ? { ...FULL } : centeredRect(lockFactor());
+    layoutBox(); schedulePreview(); renderThumbs(); syncEditorUI();
+  });
+  E.flip.addEventListener('click', () => {
+    if (!ed) return;
+    ed.flip = !ed.flip;
+    ed.crop.x = 1 - ed.crop.x - ed.crop.w;
+    schedulePreview(); renderThumbs(); updateCropUI();
+  });
+  $$('[data-adj]').forEach(inp => inp.addEventListener('input', () => {
+    if (!ed) return;
+    const k = inp.dataset.adj;
+    ed.adj[k] = Number(inp.value);
+    $('#o' + k.toUpperCase()).textContent = inp.value;
+    schedulePreview();
+  }));
+  E.reset.addEventListener('click', () => {
+    if (!ed) return;
+    Object.assign(ed, { rot: 0, flip: false, crop: { ...FULL }, ratio: 'free', filter: 'none', adj: { b: 0, c: 0, s: 0 } });
+    layoutBox(); syncEditorUI(); schedulePreview(); renderThumbs();
+  });
+
+  /* Recorte: mover el recuadro o arrastrar una esquina */
+  E.crop.addEventListener('pointerdown', e => {
+    if (!ed || E.crop.classList.contains('locked')) return;
+    const r = E.box.getBoundingClientRect(), c = ed.crop;
+    const h = e.target.closest && e.target.closest('.handle');
+    if (h) {
+      const k = h.dataset.c;
+      cd = { id: e.pointerId, mode: 'corner', r, ax: k.includes('w') ? c.x + c.w : c.x, ay: k.includes('n') ? c.y + c.h : c.y };
+    } else {
+      cd = { id: e.pointerId, mode: 'move', r, sx: e.clientX, sy: e.clientY, c0: { ...c } };
+    }
+    try { E.crop.setPointerCapture(e.pointerId); } catch { /* nada */ }
+    e.preventDefault();
+  });
+  E.crop.addEventListener('pointermove', e => {
+    if (!cd || e.pointerId !== cd.id || !ed) return;
+    const r = cd.r;
+    if (cd.mode === 'move') {
+      const dx = (e.clientX - cd.sx) / r.width, dy = (e.clientY - cd.sy) / r.height;
+      ed.crop = { x: clampN(cd.c0.x + dx, 0, 1 - cd.c0.w), y: clampN(cd.c0.y + dy, 0, 1 - cd.c0.h), w: cd.c0.w, h: cd.c0.h };
+    } else {
+      const px = clampN((e.clientX - r.left) / r.width, 0, 1), py = clampN((e.clientY - r.top) / r.height, 0, 1);
+      ed.crop = cornerRect(cd.ax, cd.ay, px, py, lockFactor());
+    }
+    updateCropUI();
+  });
+  const endCrop = e => { if (cd && e.pointerId === cd.id) cd = null; };
+  E.crop.addEventListener('pointerup', endCrop);
+  E.crop.addEventListener('pointercancel', endCrop);
+
+  /* Abrir, cancelar y cerrar */
+  async function openEditor(it) {
+    if (!it || it.type !== 'photo') return;
+    const img = new Image();
+    img.src = urlFor(it);
+    try { await img.decode(); } catch { toast('No se pudo abrir la foto'); return; }
+    ed = {
+      item: it, img, W: img.naturalWidth, H: img.naturalHeight, rot: 0, flip: false,
+      crop: { ...FULL }, ratio: 'free', adj: { b: 0, c: 0, s: 0 }, filter: 'none', discardArmed: false, saving: false
+    };
+    syncEditorUI(); setTab('crop');
+    E.sheet.hidden = true;
+    E.dlg.showModal();
+    layoutBox(); schedulePreview(); renderThumbs();
+  }
+  function closeEditor() {
+    E.sheet.hidden = true;
+    resetConfirm(E.replace, 'Reemplazar la original');
+    ed = null;
+    if (E.dlg.open) E.dlg.close();
+    E.canvas.width = 1; E.canvas.height = 1;
+  }
+  let discardTimer;
+  function tryCancel() {
+    if (!ed) return;
+    if (isDirty() && !ed.discardArmed) {
+      ed.discardArmed = true;
+      toast('Hay cambios sin guardar. Toca otra vez para descartarlos', 3000);
+      clearTimeout(discardTimer);
+      discardTimer = setTimeout(() => { if (ed) ed.discardArmed = false; }, 3000);
+      return;
+    }
+    closeEditor();
+  }
+  E.cancel.addEventListener('click', tryCancel);
+  E.dlg.addEventListener('cancel', e => { e.preventDefault(); if (!E.sheet.hidden) E.sheet.hidden = true; else tryCancel(); });
+  addEventListener('resize', () => { if (ed) layoutBox(); });
+
+  /* Guardar */
+  async function exportBlob() {
+    const [ow, oh] = orientedSize();
+    const cw = ow * ed.crop.w, ch = oh * ed.crop.h;
+    const scale = Math.min(1, 6000 / Math.max(cw, ch));
+    const c = document.createElement('canvas');
+    renderTo(c, ed.img, ed.W, ed.H, ed, ed.crop, scale);
+    const type = /^image\/(jpeg|png|webp)$/.test(ed.item.mime) ? ed.item.mime : 'image/jpeg';
+    const blob = await new Promise(r => c.toBlob(r, type, 0.92));
+    c.width = c.height = 1;
+    return blob;
+  }
+  E.save.addEventListener('click', () => { if (ed) E.sheet.hidden = false; });
+  E.saveCancel.addEventListener('click', () => { E.sheet.hidden = true; resetConfirm(E.replace, 'Reemplazar la original'); });
+  E.copy.addEventListener('click', () => doSave('copy'));
+  E.replace.addEventListener('click', () => {
+    if (!confirmTwice(E.replace, 'Reemplazar la original', 'Toca otra vez: no se puede deshacer')) return;
+    doSave('replace');
+  });
+
+  async function doSave(mode) {
+    const cur = ed;
+    if (!cur || cur.saving) return;
+    cur.saving = true;
+    E.copy.disabled = E.replace.disabled = true;
+    toast('Guardando…', 10000);
+    try {
+      const blob = await exportBlob();
+      if (!blob) throw new Error('No se pudo crear la imagen');
+      const it = cur.item, type = blob.type;
+      const ext = type === 'image/png' ? 'png' : type === 'image/webp' ? 'webp' : 'jpg';
+      const base = it.name.replace(/\.[^.]+$/, '');
+      const [dbn, st] = it.src === 'cam' ? [CAM_DB, CAM_STORE] : [OWN_DB, OWN_STORE];
+      let key;
+      if (mode === 'copy') {
+        const id = await writeOp(dbn, st, s => s.add({ type: 'photo', blob, mime: type, size: blob.size, created: Date.now(), name: `${base}_editada.${ext}` }));
+        key = it.src + ':' + id;
+      } else {
+        await writeOp(dbn, st, s => s.put({ id: it.id, type: 'photo', blob, mime: type, size: blob.size, created: it.created, name: `${base}.${ext}` }));
+        dropUrl(it.key);
+        key = it.key;
+      }
+      closeEditor();
+      await load();
+      renderGrid();
+      if (el.viewer.open) {
+        const idx = list.findIndex(i => i.key === key);
+        if (idx >= 0) { viewIndex = idx; renderSlides(); updateViewerUI(); } else el.viewer.close();
+      }
+      toast(mode === 'copy' ? 'Copia guardada' : 'Foto actualizada');
+    } catch (err) {
+      cur.saving = false;
+      E.copy.disabled = E.replace.disabled = false;
+      toast('No se pudo guardar la foto. Revisa el espacio del teléfono.', 3800);
+    }
+    E.copy.disabled = E.replace.disabled = false;
+  }
+
+  el.vEdit.addEventListener('click', () => openEditor(list[viewIndex]));
 
   /* =========================================================
      Instalación y actualizaciones
