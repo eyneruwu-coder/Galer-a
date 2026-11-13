@@ -1,6 +1,7 @@
-// Service worker: permite usar la app sin conexión y que se pueda instalar.
-// Con internet siempre pide la versión más nueva; sin internet usa la copia guardada.
-const VERSION = 'camara-v6';
+// Service worker de la galería. Con internet siempre pide la versión más nueva;
+// sin internet usa la copia guardada. Solo toca sus propias cachés (prefijo "galeria-").
+const PREFIX = 'galeria-';
+const VERSION = 'galeria-v1';
 const ASSETS = [
   './',
   './index.html',
@@ -20,7 +21,6 @@ self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(VERSION)
       .then(cache => Promise.all(ASSETS.map(url =>
-        // cache: 'reload' evita copias viejas guardadas por el navegador
         fetch(new Request(url, { cache: 'reload' })).then(res => {
           if (!res.ok) throw new Error('No se pudo descargar ' + url);
           return cache.put(url, res);
@@ -33,7 +33,7 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k.startsWith('camara-') && k !== VERSION).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k.startsWith(PREFIX) && k !== VERSION).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
