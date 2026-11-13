@@ -1,0 +1,10 @@
+GALERÍA — cómo subirla al mismo repositorio de la cámara
+
+1. Sube la carpeta "galeria" a la raíz del repositorio. En GitHub desde el teléfono
+   no se pueden subir carpetas: crea "galeria/leeme.txt" (Add file > Create new file)
+   y luego sube dentro de "galeria" cada archivo, y dentro de "galeria/icons"
+   los iconos, igual que hiciste con la cámara.
+2. Reemplaza también "sw.js" de la raíz con el que viene aquí (así la cámara
+   no borra la caché de la galería).
+3. Haz todo en el menor número de "Commit changes" posible.
+4. La galería quedará en: https://TU-USUARIO.github.io/NOMBRE-DEL-REPO/galeria/
