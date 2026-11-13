@@ -164,6 +164,7 @@
      ========================================================= */
   const selected = new Set();
   let selecting = false;
+  let tileEls = [];
 
   const loadTile = t => {
     const it = list[+t.dataset.i];
@@ -217,7 +218,8 @@
       frag.append(makeTile(it, i));
     });
     el.grid.replaceChildren(frag);
-    $$('.tile', el.grid).forEach(t => { if (observer) observer.observe(t); else loadTile(t); });
+    tileEls = [];
+    $$('.tile', el.grid).forEach(t => { tileEls[+t.dataset.i] = t; if (observer) observer.observe(t); else loadTile(t); });
     el.empty.hidden = all.length > 0;
     el.grid.hidden = list.length === 0;
     const total = all.reduce((s, i) => s + i.size, 0);
@@ -274,30 +276,102 @@
     updateSelectionUI();
   });
 
-  /* Tocar y mantener para empezar a seleccionar */
-  let press = null, suppressClick = false;
+  /* Tocar y mantener para empezar a seleccionar; sin soltar, arrastra para seleccionar varias */
+  let press = null, suppressClick = false, dragSel = null, lastPt = null, scrollRaf = 0;
+
+  const tileIndexAt = (x, y) => {
+    const n = document.elementFromPoint(x, y);
+    const t = n && n.closest ? n.closest('.tile') : null;
+    return t ? +t.dataset.i : -1;
+  };
+
+  // Marca (o desmarca) todo el rango entre el primer elemento y el que está bajo el dedo
+  function paintRange(c) {
+    const d = dragSel;
+    if (!d || c < 0) return;
+    const lo = Math.min(d.anchor, c), hi = Math.max(d.anchor, c);
+    if (lo === d.lo && hi === d.hi) return;
+    const next = new Set(d.base);
+    for (let i = lo; i <= hi; i++) {
+      const k = list[i] && list[i].key;
+      if (!k) continue;
+      if (d.mode === 'select') next.add(k); else next.delete(k);
+    }
+    const from = Math.min(lo, d.lo), to = Math.max(hi, d.hi);
+    selected.clear(); next.forEach(k => selected.add(k));
+    for (let i = from; i <= to; i++) {
+      const t = tileEls[i];
+      if (t && list[i]) t.classList.toggle('sel', selected.has(list[i].key));
+    }
+    d.lo = lo; d.hi = hi;
+    updateSelectionUI();
+  }
+
+  // Desplazamiento automático al acercar el dedo al borde de arriba o abajo
+  const edgeDir = y => {
+    const r = el.scroller.getBoundingClientRect();
+    return y < r.top + 90 ? -1 : (y > r.bottom - 130 ? 1 : 0);
+  };
+  function edgeScroll() {
+    if (scrollRaf || !dragSel || !lastPt || !edgeDir(lastPt.y)) return;
+    const step = () => {
+      scrollRaf = 0;
+      if (!dragSel || !lastPt) return;
+      const dir = edgeDir(lastPt.y);
+      if (!dir) return;
+      el.scroller.scrollTop += dir * 14;
+      paintRange(tileIndexAt(lastPt.x, lastPt.y));
+      scrollRaf = requestAnimationFrame(step);
+    };
+    scrollRaf = requestAnimationFrame(step);
+  }
+
   el.grid.addEventListener('pointerdown', e => {
     const t = e.target.closest('.tile'); if (!t) return;
     press = {
       x: e.clientX, y: e.clientY,
       timer: setTimeout(() => {
-        press = null; suppressClick = true; vibrate(18);
-        const it = list[+t.dataset.i]; if (!it) return;
+        press = null;
+        const i = +t.dataset.i, it = list[i];
+        if (!it) return;
+        suppressClick = true; vibrate(18);
         if (!selecting) setSelecting(true);
-        toggleItem(it);
-      }, 480)
+        dragSel = { anchor: i, mode: selected.has(it.key) ? 'deselect' : 'select', base: new Set(selected), lo: i, hi: i - 1 };
+        lastPt = { x: e.clientX, y: e.clientY };
+        paintRange(i);
+      }, 450)
     };
   });
   el.grid.addEventListener('pointermove', e => {
-    if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 10) { clearTimeout(press.timer); press = null; }
+    if (press) {
+      if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 10) { clearTimeout(press.timer); press = null; }
+      return;
+    }
+    if (dragSel) {
+      lastPt = { x: e.clientX, y: e.clientY };
+      paintRange(tileIndexAt(e.clientX, e.clientY));
+      edgeScroll();
+    }
   });
-  const cancelPress = () => { if (press) { clearTimeout(press.timer); press = null; } };
-  el.grid.addEventListener('pointerup', cancelPress);
-  el.grid.addEventListener('pointercancel', cancelPress);
+  // Mientras se arrastra para seleccionar, la pantalla no debe desplazarse sola
+  el.grid.addEventListener('touchmove', e => { if (dragSel && e.cancelable) e.preventDefault(); }, { passive: false });
+
+  const endPress = () => {
+    if (press) { clearTimeout(press.timer); press = null; }
+    if (dragSel) {
+      dragSel = null; lastPt = null;
+      cancelAnimationFrame(scrollRaf); scrollRaf = 0;
+      if (selected.size === 0) setSelecting(false);
+    }
+    // El "clic" que a veces llega al soltar se ignora; el seguro se quita siempre, llegue o no ese clic
+    if (suppressClick) setTimeout(() => { suppressClick = false; }, 80);
+  };
+  el.grid.addEventListener('pointerup', endPress);
+  el.grid.addEventListener('pointercancel', endPress);
   el.grid.addEventListener('contextmenu', e => e.preventDefault());
   el.grid.addEventListener('click', e => {
     const t = e.target.closest('.tile'); if (!t) return;
-    if (suppressClick) { suppressClick = false; return; }
+    if (suppressClick) return;
     const it = list[+t.dataset.i]; if (!it) return;
     if (selecting) toggleItem(it); else openViewer(+t.dataset.i);
   });
@@ -497,7 +571,7 @@
   let swReg = null;
   if ('serviceWorker' in navigator) {
     const ctl = navigator.serviceWorker.controller;
-    const hadOwnController = !!(ctl && ctl.scriptURL && ctl.scriptURL.indexOf('/galeria/') !== -1);
+    const hadOwnController = !!(ctl && ctl.scriptURL === new URL('./sw.js', location.href).href);
     let reloading = false;
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       if (!hadOwnController || reloading) return;
